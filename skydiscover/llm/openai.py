@@ -13,6 +13,10 @@ import openai
 
 from skydiscover.config import LLMModelConfig
 from skydiscover.llm.base import LLMInterface, LLMResponse
+from skydiscover.llm.responses_utils import (
+    convert_messages_to_responses_input,
+    extract_responses_output,
+)
 
 logger = logging.getLogger("skydiscover.llm")
 
@@ -142,17 +146,19 @@ class OpenAILLM(LLMInterface):
             params = {
                 "model": self.model,
                 "messages": formatted_messages,
-                "temperature": kwargs.get("temperature", self.temperature),
-                "top_p": kwargs.get("top_p", self.top_p),
                 "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             }
+            temperature = kwargs.get("temperature", self.temperature)
+            if temperature is not None:
+                params["temperature"] = temperature
+            top_p = kwargs.get("top_p", self.top_p)
+            if top_p is not None:
+                params["top_p"] = top_p
             reasoning_effort = kwargs.get("reasoning_effort", self.reasoning_effort)
             if reasoning_effort is not None:
                 params["reasoning_effort"] = reasoning_effort
 
-        retries = kwargs.get("retries", self.retries)
-        retry_delay = kwargs.get("retry_delay", self.retry_delay)
-        timeout = kwargs.get("timeout", self.timeout)
+        retries, retry_delay, timeout = self._resolve_retry_options(**kwargs)
 
         for attempt in range(retries + 1):
             try:
@@ -172,10 +178,61 @@ class OpenAILLM(LLMInterface):
 
     async def _call_api(self, params: Dict[str, Any]) -> str:
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None, lambda: self.client.chat.completions.create(**params)
+        try:
+            response = await loop.run_in_executor(
+                None, lambda: self.client.chat.completions.create(**params)
+            )
+            return response.choices[0].message.content
+        except (openai.BadRequestError, openai.APIStatusError) as exc:
+            # Some Azure deployments only expose the Responses API.
+            # Fall back transparently when Chat Completions is unsupported.
+            if "unsupported" not in str(exc).lower() and "not found" not in str(exc).lower():
+                raise
+            logger.info("Chat Completions unsupported; falling back to Responses API")
+            return await self._call_api_via_responses(params)
+
+    async def _call_api_via_responses(self, params: Dict[str, Any]) -> str:
+        """Translate a Chat-Completions-style *params* dict into a Responses API
+        call and return the assistant text."""
+        messages = params.get("messages", [])
+        input_items = self._convert_to_responses_input(
+            [m for m in messages if m.get("role") != "system"]
         )
-        return response.choices[0].message.content
+        system_msg = next((m["content"] for m in messages if m.get("role") == "system"), None)
+        resp_params: Dict[str, Any] = {
+            "model": params.get("model", self.model),
+            "input": input_items,
+        }
+        if system_msg:
+            resp_params["instructions"] = system_msg
+        if params.get("max_tokens"):
+            resp_params["max_output_tokens"] = params["max_tokens"]
+        if params.get("max_completion_tokens"):
+            resp_params["max_output_tokens"] = params["max_completion_tokens"]
+        if params.get("temperature") is not None:
+            resp_params["temperature"] = params["temperature"]
+        if params.get("reasoning_effort") is not None:
+            resp_params["reasoning"] = {"effort": params["reasoning_effort"]}
+
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, lambda: self.client.responses.create(**resp_params)
+        )
+        text, _ = self._extract_responses_output(response)
+        return text or ""
+
+    def _resolve_retry_options(self, **kwargs) -> Tuple[int, int, int]:
+        """Resolve retry/timeout options from kwargs, falling back to instance defaults."""
+        retries = kwargs.get("retries", self.retries)
+        if retries is None:
+            retries = 0
+        retry_delay = kwargs.get("retry_delay", self.retry_delay)
+        if retry_delay is None:
+            retry_delay = 2
+        timeout = kwargs.get("timeout", self.timeout)
+        if timeout is None:
+            timeout = 300
+        return retries, retry_delay, timeout
 
     # ------------------------------------------------------------------
     # Image generation (OpenAI Responses API)
@@ -190,7 +247,7 @@ class OpenAILLM(LLMInterface):
         output_dir = kwargs.get("output_dir", tempfile.gettempdir())
         program_id = kwargs.get("program_id", "")
 
-        input_items = self._convert_to_responses_input(messages)
+        input_items = convert_messages_to_responses_input(messages)
 
         params: Dict[str, Any] = {
             "model": self.model,
@@ -212,14 +269,12 @@ class OpenAILLM(LLMInterface):
         if self.max_tokens is not None:
             params["max_output_tokens"] = kwargs.get("max_tokens", self.max_tokens)
 
-        retries = kwargs.get("retries", self.retries) or 0
-        retry_delay = kwargs.get("retry_delay", self.retry_delay) or 2
-        timeout = kwargs.get("timeout", self.timeout) or 300
+        retries, retry_delay, timeout = self._resolve_retry_options(**kwargs)
 
         for attempt in range(retries + 1):
             try:
                 response = await asyncio.wait_for(self._call_responses_api(params), timeout=timeout)
-                text, image_b64 = self._extract_responses_output(response)
+                text, image_b64, _ = extract_responses_output(response)
 
                 image_path = None
                 if image_b64:
@@ -252,44 +307,3 @@ class OpenAILLM(LLMInterface):
     async def _call_responses_api(self, params: Dict[str, Any]):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: self.client.responses.create(**params))
-
-    @staticmethod
-    def _extract_responses_output(response) -> Tuple[str, Optional[str]]:
-        text_parts: List[str] = []
-        image_b64: Optional[str] = None
-        for item in response.output:
-            if item.type == "message":
-                for part in item.content:
-                    if hasattr(part, "text"):
-                        text_parts.append(part.text)
-            elif item.type == "image_generation_call":
-                if item.result:
-                    image_b64 = item.result
-        return "\n".join(text_parts), image_b64
-
-    @staticmethod
-    def _convert_to_responses_input(messages: List[Dict[str, Any]]) -> list:
-        """Convert Chat Completions-style messages to Responses API input format."""
-        items = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                items.append(
-                    {
-                        "type": "message",
-                        "role": role,
-                        "content": [{"type": "input_text", "text": content}],
-                    }
-                )
-            elif isinstance(content, list):
-                parts = []
-                for part in content:
-                    ptype = part.get("type", "")
-                    if ptype == "text":
-                        parts.append({"type": "input_text", "text": part["text"]})
-                    elif ptype == "image_url":
-                        url = part.get("image_url", {}).get("url", "")
-                        parts.append({"type": "input_image", "image_url": url, "detail": "auto"})
-                items.append({"type": "message", "role": role, "content": parts})
-        return items

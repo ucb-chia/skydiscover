@@ -3,11 +3,56 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from skydiscover.search.base_database import Program, ProgramDatabase
 
 logger = logging.getLogger(__name__)
+
+
+def load_evaluator_code(evaluation_file: Optional[str]) -> str:
+    """Return evaluator source as a string for LLM context.
+
+    For a plain Python file, returns its contents.
+    For a containerized benchmark directory, returns all text files except
+    infrastructure files (Dockerfile, requirements.txt) and data files (.json).
+    """
+    if not evaluation_file:
+        return ""
+    try:
+        p = Path(evaluation_file)
+        if not p.exists():
+            return ""
+        if p.is_dir():
+            # Harbor task: prioritize instruction.md — it contains the full
+            # problem description, reference implementation, and constraints.
+            instruction = p / "instruction.md"
+            if instruction.exists():
+                return instruction.read_text()
+
+            _SKIP = {"Dockerfile", "requirements.txt"}
+            _MAX_FILES = 10
+            _MAX_BYTES = 50_000
+            parts = []
+            for f in sorted(p.iterdir()):
+                if len(parts) >= _MAX_FILES:
+                    break
+                if not f.is_file():
+                    continue
+                if f.name in _SKIP or f.suffix == ".json":
+                    continue
+                if f.stat().st_size > _MAX_BYTES:
+                    continue
+                try:
+                    parts.append(f"# {f.name}\n{f.read_text()}")
+                except Exception:
+                    pass  # skip binary or unreadable files
+            return "\n\n".join(parts)
+        return p.read_text()
+    except Exception as e:
+        logger.warning(f"Could not load evaluator code from {evaluation_file}: {e}")
+        return ""
 
 
 @dataclass
@@ -19,6 +64,8 @@ class SerializableResult:
     other_context_ids: Optional[List[str]] = None
 
     iteration_time: float = 0.0
+    llm_generation_time: float = 0.0
+    eval_time: float = 0.0
     prompt: Optional[Dict[str, str]] = None
     llm_response: Optional[str] = None
     iteration: int = 0

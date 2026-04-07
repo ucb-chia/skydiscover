@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 import uuid
 from typing import Optional
@@ -59,6 +60,8 @@ class Runner:
         )
         if self.initial_program_solution and not self.config.language:
             self.config.language = extract_solution_language(self.initial_program_solution)
+        if not self.config.language:
+            self.config.language = "python"
 
         # Set the file extension
         ext = os.path.splitext(initial_program_path)[1] if initial_program_path else ".py"
@@ -177,12 +180,31 @@ class Runner:
             if final_iteration > 0:
                 self._save_checkpoint(final_iteration)
 
+            # Re-evaluate best program in test mode (authoritative score).
+            best = self._get_best_program()
+            if best:
+                try:
+                    test_result = await self.discovery_controller.evaluator.evaluate_program(
+                        best.solution, best.id, mode="test"
+                    )
+                    for k, v in test_result.metrics.items():
+                        best.metrics[f"test_{k}"] = v
+                    logger.info(
+                        f"Test evaluation for best program: {format_metrics(test_result.metrics)}"
+                    )
+                    # Persist test metrics to disk so they survive the run.
+                    self._save_best_program(best)
+                except Exception as e:
+                    logger.warning(f"Test-mode re-evaluation failed: {e}")
+
         finally:
             # Stop the monitor
             early_stopped = (
                 self.discovery_controller is not None
                 and self.discovery_controller.early_stopping_triggered
             )
+            if self.discovery_controller is not None:
+                self.discovery_controller.close()
             self.discovery_controller = None
 
             if monitor_server:
@@ -335,8 +357,16 @@ class Runner:
     def _install_signal_handlers(self) -> None:
         def on_signal(signum, frame):
             logger.info(f"Signal {signum} received, shutting down...")
-            self.discovery_controller.request_shutdown()
-            signal.signal(signal.SIGINT, lambda s, f: __import__("sys").exit(0))
+            if self.discovery_controller is not None:
+                self.discovery_controller.request_shutdown()
+
+            def force_exit(signum, frame):
+                sys.exit(128 + signum)
+
+            # After the first termination signal, ensure subsequent SIGINT/SIGTERM
+            # cause an immediate exit instead of re-running the soft handler.
+            signal.signal(signal.SIGINT, force_exit)
+            signal.signal(signal.SIGTERM, force_exit)
 
         signal.signal(signal.SIGINT, on_signal)
         signal.signal(signal.SIGTERM, on_signal)
@@ -373,6 +403,8 @@ class Runner:
             ) as f:
                 f.write(best.solution)
             with open(os.path.join(checkpoint_path, "best_program_info.json"), "w") as f:
+                from skydiscover.search.utils.checkpoint_manager import SafeJSONEncoder
+
                 json.dump(
                     {
                         "id": best.id,
@@ -386,6 +418,7 @@ class Runner:
                     },
                     f,
                     indent=2,
+                    cls=SafeJSONEncoder,
                 )
             logger.info(f"Checkpoint {iteration}: best={format_metrics(best.metrics)}")
 
@@ -414,6 +447,8 @@ class Runner:
 
         info_path = os.path.join(best_dir, "best_program_info.json")
         with open(info_path, "w") as f:
+            from skydiscover.search.utils.checkpoint_manager import SafeJSONEncoder
+
             json.dump(
                 {
                     "id": program.id,
@@ -427,6 +462,7 @@ class Runner:
                 },
                 f,
                 indent=2,
+                cls=SafeJSONEncoder,
             )
 
         if self.config.language == "image" and program.metadata:

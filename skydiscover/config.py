@@ -152,12 +152,12 @@ class LLMConfig(LLMModelConfig):
     """Configuration for LLM models"""
 
     # API configuration
-    api_base: str = "https://api.openai.com/v1"
+    api_base: str = _PROVIDERS["openai"][0]
 
     # Generation parameters
     system_message: Optional[str] = "system_message"
-    temperature: float = 0.7
-    top_p: float = 0.95
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = None
     max_tokens: int = 32000
 
     # Request parameters
@@ -189,10 +189,22 @@ class LLMConfig(LLMModelConfig):
             self.guide_models = self.models.copy()
 
         # Resolve per-model api_base, api_key, and bare name from provider prefix
+        # Check if user explicitly set api_base at the LLMConfig level
+        # (i.e. it differs from the hardcoded default).  When a custom api_base
+        # is provided, we should NOT override it with the provider default so
+        # that update_model_params() below can propagate the user's value.
+        user_set_api_base = self.api_base.rstrip("/") != _PROVIDERS["openai"][0].rstrip("/")
         for model in self.models + self.evaluator_models + self.guide_models:
             if model.name and model.api_base is None:
                 provider, bare_name, provider_base, env_vars = _parse_model_spec(model.name)
-                if provider_base:
+                # Skip provider URL only for unrecognized bare names that fell
+                # through to the OpenAI default — never for an explicitly-prefixed
+                # provider (e.g. "anthropic/claude-3-sonnet") or a known bare prefix.
+                is_fallback = provider == "openai" and not (
+                    model.name.startswith("openai/")
+                    or any(model.name.startswith(p) for p in _BARE_PREFIX_MAP)
+                )
+                if provider_base and not (user_set_api_base and is_fallback):
                     model.api_base = provider_base
                 if model.api_key is None:
                     model.api_key = _resolve_api_key_from_env(env_vars)
@@ -490,6 +502,12 @@ class SearchConfig:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     num_context_programs: int = 4
     output_dir: Optional[str] = None
+    switch_interval: Optional[int] = (
+        None  # EvoX: stagnation iters before strategy switch. Auto-calculated if None.
+    )
+    share_llm: bool = (
+        False  # EvoX: if True, meta-level search evolution uses the same LLM as the main discovery process.
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -509,7 +527,7 @@ class MonitorConfig:
     # AI summary settings
     summary_model: str = "gpt-5-mini"
     summary_api_key: Optional[str] = None  # Falls back to OPENAI_API_KEY
-    summary_api_base: str = "https://api.openai.com/v1"
+    summary_api_base: str = _PROVIDERS["openai"][0]
     summary_top_k: int = 3
     summary_interval: int = 0  # Auto-generate every N programs (0 = manual)
 
@@ -771,6 +789,10 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> Config:
 
     # Make the system message available to the individual models, in case it is not provided from the prompt sampler
     config.llm.update_model_params({"system_message": config.context_builder.system_message})
+
+    # Bridge provider env vars so that downstream configs (e.g. evox search.yaml)
+    # can resolve ${OPENAI_API_KEY} from the environment.
+    bridge_provider_env(config)
 
     return config
 

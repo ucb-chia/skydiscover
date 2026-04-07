@@ -61,6 +61,7 @@ class CoEvolutionController(DiscoveryController):
             evaluation_file=db_cfg.evaluation_file,
             config_path=db_cfg.config_path,
             output_dir=self.config.search.output_dir,
+            parent_llm_config=self.config.llm if self.config.search.share_llm else None,
         )
         self.search_controller = DiscoveryController(controller_input)
         self.search_scorer = LogWindowScorer()
@@ -75,7 +76,7 @@ class CoEvolutionController(DiscoveryController):
         self._best_search_score: Optional[float] = None
         self._num_search_evolutions = 0
 
-        self._switch_interval = None
+        self._switch_interval = getattr(self.config.search, "switch_interval", None)
         self._stagnant_count = 0
         self._last_tracked_best_score: Optional[float] = None
 
@@ -286,12 +287,9 @@ class CoEvolutionController(DiscoveryController):
             return
 
         system_message = self.config.context_builder.system_message or ""
-        evaluator_code = ""
-        if self.evaluation_file:
-            try:
-                evaluator_code = Path(self.evaluation_file).read_text()
-            except Exception as e:
-                logger.warning(f"Failed to read search strategy evaluator file: {e}")
+        from skydiscover.search.utils.discovery_utils import load_evaluator_code
+
+        evaluator_code = load_evaluator_code(self.evaluation_file)
 
         try:
             problem_dir = Path(self.evaluation_file).parent if self.evaluation_file else None
