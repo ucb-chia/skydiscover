@@ -201,11 +201,15 @@ class AdaEvolveController(DiscoveryController):
 
             # Add child program info if available
             if child_program:
+                metadata = child_program.get("metadata", {})
                 stats["iteration_result"]["child_program"] = {
                     "id": child_program.get("id"),
                     "metrics": child_program.get("metrics"),
                     "generation": child_program.get("generation"),
                     "parent_id": child_program.get("parent_id"),
+                    "changes": metadata.get("changes", ""),
+                    "island_id": metadata.get("island_id"),
+                    "sampling_mode": metadata.get("sampling_mode"),
                 }
 
             # Write to JSONL file
@@ -229,11 +233,22 @@ class AdaEvolveController(DiscoveryController):
         max_iterations: int,
         checkpoint_callback=None,
     ) -> Optional[Program]:
-        """Run evolution with adaptive search intensity and island rotation."""
+        """Run evolution with adaptive search intensity and island rotation.
+
+        When ``config.max_parallel_iterations > 1``, iterations run
+        concurrently as asyncio tasks bounded by a semaphore.  While
+        iteration *i* evaluates (compile + sim), iterations *i+1..i+K*
+        can generate LLM solutions and start their own evals, keeping
+        build and sim workers saturated.
+        """
+        import asyncio
+
         total = start_iteration + max_iterations
+        max_parallel = getattr(self.config, "max_parallel_iterations", 1)
         logger.info(
             f"AdaEvolve: Running {max_iterations} iterations "
-            f"across {self.database.num_islands} islands"
+            f"across {self.database.num_islands} islands "
+            f"(max_parallel={max_parallel})"
         )
 
         # Set up comprehensive JSON logging for iteration stats
@@ -242,19 +257,106 @@ class AdaEvolveController(DiscoveryController):
         # Ensure all islands are seeded
         self._ensure_all_islands_seeded()
 
-        for iteration in range(start_iteration, total):
-            if self.shutdown_event.is_set():
-                logger.info("Shutdown requested")
-                break
+        if max_parallel <= 1:
+            # Sequential path — original behaviour
+            for iteration in range(start_iteration, total):
+                if self.shutdown_event.is_set():
+                    logger.info("Shutdown requested")
+                    break
+                try:
+                    await self._run_iteration(iteration, checkpoint_callback)
+                except Exception as e:
+                    logger.exception(f"Iteration {iteration} failed: {e}")
+                finally:
+                    self.database.end_iteration(iteration)
+        else:
+            # Parallel path — up to K iterations in flight
+            sem = asyncio.Semaphore(max_parallel)
+            # Lock for database mutations (_process_result + end_iteration)
+            db_lock = asyncio.Lock()
+            pending: set = set()
 
-            try:
-                await self._run_iteration(iteration, checkpoint_callback)
-            except Exception as e:
-                logger.exception(f"Iteration {iteration} failed: {e}")
-            finally:
-                # CRITICAL: Tell database iteration is complete
-                # This handles island rotation (UCB) and migration
-                self.database.end_iteration(iteration)
+            async def _bounded_iteration(iteration: int) -> int:
+                async with sem:
+                    if self.shutdown_event.is_set():
+                        return iteration
+                    # Check for paradigm stagnation (under semaphore so only
+                    # one iteration triggers paradigm generation at a time)
+                    if (self.database.use_paradigm_breakthrough
+                            and self.database.is_paradigm_stagnating()):
+                        await self._generate_paradigms_if_needed()
+
+                    iteration_start_time = time.time()
+                    try:
+                        result = await self._run_normal_step(iteration)
+                    except Exception as e:
+                        logger.exception(f"Iteration {iteration} failed: {e}")
+                        async with db_lock:
+                            self.database.end_iteration(iteration)
+                        return iteration
+
+                iteration_time = time.time() - iteration_start_time
+
+                # Process result under lock (database.add, monitor callback,
+                # end_iteration are all sync and must not interleave)
+                async with db_lock:
+                    if result.error:
+                        logger.warning(f"Iteration {iteration}: {result.error}")
+                        self._log_iteration_stats(
+                            iteration=iteration,
+                            sampling_mode=self._last_sampling_mode,
+                            sampling_intensity=self._last_sampling_intensity,
+                            child_program=None,
+                            iteration_time=iteration_time,
+                            llm_generation_time=result.llm_generation_time,
+                            eval_time=result.eval_time,
+                            error=result.error,
+                        )
+                    else:
+                        self._process_result(result, iteration, checkpoint_callback)
+                        self._log_iteration_stats(
+                            iteration=iteration,
+                            sampling_mode=self._last_sampling_mode,
+                            sampling_intensity=self._last_sampling_intensity,
+                            child_program=result.child_program_dict,
+                            iteration_time=result.iteration_time,
+                            llm_generation_time=result.llm_generation_time,
+                            eval_time=result.eval_time,
+                            error=None,
+                        )
+                    self.database.end_iteration(iteration)
+
+                return iteration
+
+            for iteration in range(start_iteration, total):
+                if self.shutdown_event.is_set():
+                    break
+                task = asyncio.create_task(
+                    _bounded_iteration(iteration),
+                    name=f"adaevolve_iter_{iteration}",
+                )
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+
+                # Backpressure: when pipeline is full, wait for one to finish
+                if len(pending) >= max_parallel:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in done:
+                        try:
+                            t.result()  # propagate exceptions
+                        except Exception as e:
+                            logger.warning(f"Parallel iteration exception: {e}")
+
+            # Drain remaining
+            if pending:
+                done, _ = await asyncio.wait(pending)
+                for t in done:
+                    try:
+                        t.result()
+                    except Exception as e:
+                        logger.warning(f"Parallel iteration exception: {e}")
 
         logger.info("AdaEvolve completed")
         self.database.log_status()
@@ -426,6 +528,7 @@ class AdaEvolveController(DiscoveryController):
             )
 
         # Log progress
+        changes = child.metadata.get("changes", "")
         logger.info(
             f"Iteration {iteration}: Program {child.id[:8]} "
             f"(parent: {result.parent_id[:8] if result.parent_id else 'None'}) "
@@ -433,6 +536,8 @@ class AdaEvolveController(DiscoveryController):
             f" (llm: {result.llm_generation_time:.2f}s,"
             f" eval: {result.eval_time:.2f}s)"
         )
+        if changes:
+            logger.info(f"  Changes: {changes}")
 
         # Log metrics
         if child.metrics:
@@ -679,6 +784,19 @@ class AdaEvolveController(DiscoveryController):
         child_metadata = {"changes": changes, "parent_metrics": parent.metrics}
         if image_path:
             child_metadata["image_path"] = image_path
+        # Capture LLM call metadata (model used, token counts) — set by openai.py
+        try:
+            if hasattr(result, "model_used") and result.model_used:
+                child_metadata["llm_model_used"] = result.model_used
+            if hasattr(result, "prompt_tokens") and result.prompt_tokens is not None:
+                child_metadata["llm_prompt_tokens"] = result.prompt_tokens
+            if hasattr(result, "completion_tokens") and result.completion_tokens is not None:
+                child_metadata["llm_completion_tokens"] = result.completion_tokens
+            if hasattr(result, "total_tokens") and result.total_tokens is not None:
+                child_metadata["llm_total_tokens"] = result.total_tokens
+            child_metadata["llm_generation_time_sec"] = llm_generation_time
+        except Exception:
+            pass
         child = Program(
             id=child_id,
             solution=child_solution,

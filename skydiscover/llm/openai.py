@@ -68,8 +68,17 @@ class OpenAILLM(LLMInterface):
 
         max_retries = self.retries if self.retries is not None else 0
         is_azure = self.api_base and ".openai.azure.com" in self.api_base.lower()
+        self._use_litellm = self.api_base and "bedrock" in (self.api_base or "").lower()
 
-        if is_azure:
+        if self._use_litellm:
+            # Bedrock via litellm library — no proxy needed
+            self.client = None
+            # Model name should be like "bedrock/us.anthropic.claude-opus-4-6-v1"
+            if not self.model.startswith("bedrock/"):
+                self._litellm_model = f"bedrock/{self.model}"
+            else:
+                self._litellm_model = self.model
+        elif is_azure:
             parsed_url = urlparse(self.api_base)
             azure_endpoint = f"{parsed_url.scheme}://{parsed_url.netloc}"
             query_params = parse_qs(parsed_url.query)
@@ -115,8 +124,17 @@ class OpenAILLM(LLMInterface):
         """Generate a response. Pass image_output=True for image generation."""
         if kwargs.get("image_output"):
             return await self._generate_with_image(system_message, messages, **kwargs)
+        # Reset usage tracker before call; _call_api populates it
+        self._last_usage = {}
         text = await self._generate_text(system_message, messages, **kwargs)
-        return LLMResponse(text=text)
+        u = getattr(self, "_last_usage", {}) or {}
+        return LLMResponse(
+            text=text,
+            model_used=u.get("model") or self.model,
+            prompt_tokens=u.get("prompt_tokens"),
+            completion_tokens=u.get("completion_tokens"),
+            total_tokens=u.get("total_tokens"),
+        )
 
     # ------------------------------------------------------------------
     # Text generation (Chat Completions API)
@@ -176,12 +194,56 @@ class OpenAILLM(LLMInterface):
                 else:
                     raise
 
+    async def _call_api_litellm(self, params: Dict[str, Any]) -> str:
+        """Call Bedrock via litellm library (no proxy needed)."""
+        import litellm
+
+        litellm_params = {
+            "model": self._litellm_model,
+            "messages": params["messages"],
+        }
+        if "max_tokens" in params:
+            litellm_params["max_tokens"] = params["max_tokens"]
+        if "temperature" in params:
+            litellm_params["temperature"] = params["temperature"]
+        # Don't pass both temperature and top_p to Bedrock
+        if "top_p" in params and "temperature" not in params:
+            litellm_params["top_p"] = params["top_p"]
+        # Pass Bedrock API key if provided (bearer token auth, no IAM needed).
+        # litellm reads this as api_key param or AWS_BEARER_TOKEN_BEDROCK env var.
+        if self.api_key and self.api_key.lower() not in ("unused", "none", ""):
+            litellm_params["api_key"] = self.api_key
+
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, lambda: litellm.completion(**litellm_params)
+        )
+        self._capture_usage(response)
+        return response.choices[0].message.content
+
+    def _capture_usage(self, response):
+        """Extract token usage from response; store in self._last_usage."""
+        try:
+            usage = getattr(response, "usage", None)
+            if usage:
+                self._last_usage = {
+                    "model": getattr(response, "model", None),
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                }
+        except Exception:
+            pass
+
     async def _call_api(self, params: Dict[str, Any]) -> str:
+        if self._use_litellm:
+            return await self._call_api_litellm(params)
         loop = asyncio.get_running_loop()
         try:
             response = await loop.run_in_executor(
                 None, lambda: self.client.chat.completions.create(**params)
             )
+            self._capture_usage(response)
             return response.choices[0].message.content
         except (openai.BadRequestError, openai.APIStatusError) as exc:
             # Some Azure deployments only expose the Responses API.

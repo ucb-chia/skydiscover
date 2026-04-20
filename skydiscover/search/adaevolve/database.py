@@ -263,6 +263,10 @@ class AdaEvolveDatabase(ProgramDatabase):
         # Global best tracking
         self._global_best_score = float("-inf")
 
+        # Migration event log — records every migration for lineage graph generation.
+        # Entries: {iteration, from_island, to_island, original_id, migrant_id, score}
+        self.migration_log: List[Dict[str, Any]] = []
+
         # Cached global Pareto front (lazy, invalidated on population changes)
         self._global_pareto_cache: Optional[List[Program]] = None
         self._global_pareto_cache_valid: bool = False
@@ -435,20 +439,26 @@ class AdaEvolveDatabase(ProgramDatabase):
             program.iteration_found = iteration
             self.last_iteration = max(self.last_iteration, iteration)
 
-        # Add to archive or legacy list
+        # Add to archive or legacy list.
+        # Migration copies are added to the archive/island only — NOT to the
+        # global self.programs dict.  This prevents duplicates in summary.md,
+        # leaderboards, and any consumer that iterates self.programs.
+        # save() rebuilds self.programs from archives before serializing, so
+        # migration copies are still persisted to disk.
         was_added = False
         if self.use_unified_archive and self.archives:
             was_added = self.archives[island_idx].add(program)
-            if was_added:
+            if was_added and not is_migration:
                 self.programs[program.id] = program
-            else:
+            elif not was_added:
                 logger.debug(
                     f"Archive rejected program {program.id[:8]} on island {island_idx} "
                     f"(fitness={self._get_fitness(program):.4f})"
                 )
         else:
             # Legacy mode: list-based storage
-            self.programs[program.id] = program
+            if not is_migration:
+                self.programs[program.id] = program
             self.islands[island_idx].append(program)
             was_added = True
 
@@ -460,6 +470,17 @@ class AdaEvolveDatabase(ProgramDatabase):
             self._enforce_island_population_limit(island_idx)
 
         if was_added:
+            # Stamp program with structured genealogy metadata
+            program.metadata["island_id"] = island_idx
+            program.metadata["is_migration"] = is_migration
+            program.metadata["sampling_mode"] = getattr(self, "_last_sampling_mode", None)
+            if is_migration:
+                program.metadata.setdefault("migration_history", []).append({
+                    "from_island": self.current_island,
+                    "to_island": island_idx,
+                    "iteration": iteration,
+                })
+
             # Update adaptive state
             fitness = self._get_fitness(program)
             if not is_migration:
@@ -835,6 +856,15 @@ class AdaEvolveDatabase(ProgramDatabase):
 
                 self.add(migrant, parent_id=None, target_island=dest_island)
 
+                self.migration_log.append({
+                    "iteration": self.last_iteration,
+                    "from_island": src_island,
+                    "to_island": dest_island,
+                    "original_id": program.id,
+                    "migrant_id": migrant.id,
+                    "score": self._get_fitness(program),
+                })
+
             if top_programs:
                 logger.debug(
                     f"Migrated {len(top_programs)} programs from island {src_island} "
@@ -869,12 +899,86 @@ class AdaEvolveDatabase(ProgramDatabase):
 
             self.add(migrant, parent_id=None, target_island=dest_island)
 
+            self.migration_log.append({
+                "iteration": self.last_iteration,
+                "from_island": src_island,
+                "to_island": dest_island,
+                "original_id": program.id,
+                "migrant_id": migrant.id,
+                "score": self._get_fitness(program),
+            })
+
     def _has_duplicate_solution(self, island_idx: int, solution: str) -> bool:
         """Check if island already has a program with identical solution."""
         if self.use_unified_archive and self.archives:
             return any(p.solution == solution for p in self.archives[island_idx].get_all())
         else:
             return any(p.solution == solution for p in self.islands[island_idx])
+
+    # =========================================================================
+    # Lineage graph
+    # =========================================================================
+
+    def get_lineage_graph(self) -> Dict[str, Any]:
+        """Build a lineage graph of all programs for visualization.
+
+        Returns a dict with:
+          - nodes: list of per-program dicts (id, iteration, score, island, flags)
+          - edges: list of {from, to, type} where type is mutation|migration|merge
+          - migration_events: the full migration log
+        """
+        # Collect ALL programs: archives (includes migration copies) + self.programs
+        all_progs: Dict[str, Program] = {}
+        if self.use_unified_archive and self.archives:
+            for archive in self.archives:
+                for p in archive.get_all():
+                    all_progs[p.id] = p
+        elif self.islands:
+            for island in self.islands:
+                for p in island:
+                    all_progs[p.id] = p
+        all_progs.update(self.programs)
+
+        nodes = []
+        for pid, prog in all_progs.items():
+            m = prog.metrics or {}
+            md = prog.metadata or {}
+            nodes.append({
+                "id": pid,
+                "short_id": pid[:8],
+                "iteration": prog.iteration_found,
+                "score": m.get("combined_score", 0),
+                "speedup": m.get("speedup_score", 0),
+                "island": md.get("island_id"),
+                "is_migration": md.get("is_migration", False),
+                "is_merge": md.get("is_merge", False),
+            })
+
+        edges = []
+        # Mutation edges (parent → child, excluding migration copies)
+        for pid, prog in all_progs.items():
+            if prog.parent_id and not (prog.metadata or {}).get("is_migration"):
+                edges.append({"from": prog.parent_id, "to": pid, "type": "mutation"})
+
+        # Migration edges from the event log
+        for event in self.migration_log:
+            edges.append({
+                "from": event["original_id"],
+                "to": event["migrant_id"],
+                "type": "migration",
+            })
+
+        # Merge edges
+        for pid, prog in all_progs.items():
+            if (prog.metadata or {}).get("is_merge"):
+                for parent_id in (prog.metadata or {}).get("merge_parent_ids", []):
+                    edges.append({"from": parent_id, "to": pid, "type": "merge"})
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "migration_events": self.migration_log,
+        }
 
     # =========================================================================
     # Statistics
@@ -1237,8 +1341,17 @@ class AdaEvolveDatabase(ProgramDatabase):
                 self.archives[0].add(best_program)
             logger.warning(f"Restored evicted best program {best_id[:8]} during save")
 
-        # Save base state (programs, prompts, artifacts)
+        # Save base state (programs, prompts, artifacts).
+        # At this point self.programs includes migration copies (rebuilt from
+        # archives above).  super().save() serializes them all to disk.
         super().save(save_path, iteration)
+
+        # Strip migration copies back out of the runtime dict.  The archives
+        # still hold them, and they're now on disk for checkpoint restore.
+        self.programs = {
+            pid: p for pid, p in self.programs.items()
+            if not (p.metadata or {}).get("is_migration")
+        }
 
         # Build AdaEvolve metadata
         metadata = {
@@ -1282,6 +1395,9 @@ class AdaEvolveDatabase(ProgramDatabase):
         if self.use_paradigm_breakthrough and self.paradigm_tracker is not None:
             metadata["use_paradigm_breakthrough"] = True
             metadata["paradigm_tracker"] = self.paradigm_tracker.to_dict()
+
+        # Migration event log (for lineage graph generation)
+        metadata["migration_log"] = self.migration_log
 
         os.makedirs(save_path, exist_ok=True)
         metadata_path = os.path.join(save_path, "adaevolve_metadata.json")
@@ -1400,10 +1516,22 @@ class AdaEvolveDatabase(ProgramDatabase):
                     if pid in self.programs:
                         self.islands[island_idx].append(self.programs[pid])
 
+        # Strip migration copies from the runtime programs dict.  They're in the
+        # archives for island-level selection, but consumers iterating
+        # self.programs (summary, leaderboards, callbacks) shouldn't see them.
+        self.programs = {
+            pid: p for pid, p in self.programs.items()
+            if not (p.metadata or {}).get("is_migration")
+        }
+
+        # Restore migration event log
+        self.migration_log = metadata.get("migration_log", [])
+
         self._invalidate_global_pareto_cache()
         logger.info(
             f"Loaded AdaEvolve state from {path}: "
-            f"{self.num_islands} islands, {len(self.programs)} programs, "
+            f"{self.num_islands} islands, {len(self.programs)} programs "
+            f"(migration copies excluded), "
             f"unified_archive={self.use_unified_archive}"
         )
 
@@ -1665,7 +1793,17 @@ class AdaEvolveDatabase(ProgramDatabase):
         return list(self._global_pareto_cache or [])
 
     def _get_fitness(self, program: Program) -> float:
-        """Get scalar fitness score used by adaptive state and fallbacks."""
+        """Get scalar fitness score used by adaptive state and fallbacks.
+
+        Uses the best available measurement: if a program has been validated
+        on FireSim (FPGA ground truth), use that score. Otherwise fall back
+        to the Verilator proxy score. No mixing or artificial boosting —
+        FireSim is simply the authoritative answer when available.
+        """
+        metrics = getattr(program, "metrics", None) or {}
+        firesim_score = metrics.get("firesim_score")
+        if firesim_score is not None:
+            return float(firesim_score)
         return self._get_multiobjective_proxy_score(program)
 
     def _update_best_program(self, program: Program) -> bool:
@@ -1984,6 +2122,13 @@ class AdaEvolveDatabase(ProgramDatabase):
 
         if was_added:
             self.programs[program.id] = program
+
+            # Stamp merged program with genealogy metadata
+            program.metadata["island_id"] = idx
+            program.metadata["is_merge"] = True
+            program.metadata["merge_parent_ids"] = parent_ids
+            program.metadata["sampling_mode"] = "merge"
+
             fitness = self._get_fitness(program)
             self.adapter.record_evaluation(idx, fitness)
             self._invalidate_global_pareto_cache()

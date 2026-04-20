@@ -11,10 +11,19 @@ class LLMResponse:
 
     text: generated text content.
     image_path: path to generated image file, or None for text-only.
+    model_used: actual model name from the API response (may differ from
+        requested model when fallback / pool routing is applied).
+    prompt_tokens: input tokens consumed (None if backend doesn't report).
+    completion_tokens: output tokens generated (None if backend doesn't report).
+    total_tokens: prompt + completion (None if backend doesn't report).
     """
 
     text: str = ""
     image_path: Optional[str] = None
+    model_used: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
 
 
 class LLMInterface(ABC):
