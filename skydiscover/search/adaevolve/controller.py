@@ -22,6 +22,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml
+
 from skydiscover.context_builder.adaevolve import AdaEvolveContextBuilder
 from skydiscover.context_builder.default import DefaultContextBuilder
 from skydiscover.evaluation.llm_judge import LLMJudge
@@ -99,6 +101,12 @@ class AdaEvolveController(DiscoveryController):
         self._last_sampling_mode: Optional[str] = None
         self._last_sampling_intensity: Optional[float] = None
 
+        # Runtime overrides: checked at the start of each iteration.
+        # Users can edit {output_dir}/runtime_overrides.yaml during a run
+        # and changes take effect on the next iteration.
+        self._runtime_overrides_path: Optional[str] = None
+        self._runtime_overrides_mtime: float = 0.0
+
         logger.info(
             f"AdaEvolveController initialized "
             f"(language={self.config.language}, "
@@ -110,6 +118,117 @@ class AdaEvolveController(DiscoveryController):
         from skydiscover.search.utils.discovery_utils import load_evaluator_code
 
         return load_evaluator_code(self.evaluation_file)
+
+    # =========================================================================
+    # Runtime config hot-reload
+    # =========================================================================
+
+    def _apply_runtime_overrides(self) -> None:
+        """Check for runtime_overrides.yaml and apply changes.
+
+        Called at the start of each iteration. Only re-reads the file if it
+        has been modified since the last check (stat mtime comparison).
+
+        Supported overrides (edit during a run, takes effect next iteration)::
+
+            # runtime_overrides.yaml
+            max_tokens: 16000
+            temperature: 0.8
+            num_context_programs: 2
+            model_weights:                  # rebalance model sampling
+              us.anthropic.claude-opus-4-6-v1: 1.0
+              us.anthropic.claude-sonnet-4-6: 2.0
+        """
+        if not self._runtime_overrides_path:
+            # Auto-discover: {output_dir}/runtime_overrides.yaml
+            out = self.output_dir or getattr(self.database.config, "db_path", None)
+            if out:
+                self._runtime_overrides_path = os.path.join(out, "runtime_overrides.yaml")
+                # Seed an empty file so the user knows where to edit
+                if not os.path.exists(self._runtime_overrides_path):
+                    try:
+                        with open(self._runtime_overrides_path, "w") as f:
+                            f.write(
+                                "# Runtime overrides — edit during a run, changes apply next iteration.\n"
+                                "# Supported keys: max_tokens, temperature, num_context_programs, model_weights\n"
+                                "# Example:\n"
+                                "#   max_tokens: 16000\n"
+                                "#   temperature: 0.8\n"
+                                "#   max_parallel_iterations: 5  (requires restart)\n"
+                            )
+                    except Exception:
+                        pass
+            else:
+                return
+
+        path = self._runtime_overrides_path
+        if not os.path.exists(path):
+            return
+
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        if mtime <= self._runtime_overrides_mtime:
+            return  # unchanged since last read
+
+        self._runtime_overrides_mtime = mtime
+        try:
+            with open(path) as f:
+                overrides = yaml.safe_load(f)
+            if not isinstance(overrides, dict) or not overrides:
+                return
+
+            applied = []
+
+            # max_tokens — update all LLM clients
+            if "max_tokens" in overrides:
+                val = int(overrides["max_tokens"])
+                for model in self.llms.models:
+                    model.max_tokens = val
+                applied.append(f"max_tokens={val}")
+
+            # temperature — update all LLM clients
+            if "temperature" in overrides:
+                val = float(overrides["temperature"])
+                for model in self.llms.models:
+                    model.temperature = val
+                applied.append(f"temperature={val}")
+
+            # num_context_programs
+            if "num_context_programs" in overrides:
+                val = int(overrides["num_context_programs"])
+                self.num_context_programs = val
+                applied.append(f"num_context_programs={val}")
+
+            # max_parallel_iterations — can't change the semaphore mid-run,
+            # but log it so the user knows to restart
+            if "max_parallel_iterations" in overrides:
+                val = int(overrides["max_parallel_iterations"])
+                current = getattr(self.config, "max_parallel_iterations", 1)
+                if val != current:
+                    logger.warning(
+                        f"max_parallel_iterations changed {current} → {val} in overrides. "
+                        f"This requires a restart to take effect."
+                    )
+
+            # model_weights — rebalance which model gets sampled
+            if "model_weights" in overrides:
+                weights_map = overrides["model_weights"]
+                if isinstance(weights_map, dict):
+                    new_weights = []
+                    for cfg in self.llms.models_cfg:
+                        w = weights_map.get(cfg.name, cfg.weight)
+                        new_weights.append(float(w))
+                    total = sum(new_weights) or 1.0
+                    self.llms.weights = [w / total for w in new_weights]
+                    applied.append(f"model_weights={weights_map}")
+
+            if applied:
+                logger.info(f"Runtime overrides applied: {', '.join(applied)}")
+
+        except Exception as e:
+            logger.warning(f"Failed to apply runtime overrides from {path}: {e}")
 
     # =========================================================================
     # JSON Logging for AdaEvolve Stats
@@ -263,6 +382,7 @@ class AdaEvolveController(DiscoveryController):
                 if self.shutdown_event.is_set():
                     logger.info("Shutdown requested")
                     break
+                self._apply_runtime_overrides()
                 try:
                     await self._run_iteration(iteration, checkpoint_callback)
                 except Exception as e:
@@ -277,23 +397,33 @@ class AdaEvolveController(DiscoveryController):
             pending: set = set()
 
             async def _bounded_iteration(iteration: int) -> int:
-                async with sem:
-                    if self.shutdown_event.is_set():
-                        return iteration
-                    # Check for paradigm stagnation (under semaphore so only
-                    # one iteration triggers paradigm generation at a time)
-                    if (self.database.use_paradigm_breakthrough
-                            and self.database.is_paradigm_stagnating()):
-                        await self._generate_paradigms_if_needed()
+                # The semaphore gates how many iterations can START (LLM gen +
+                # parent sampling) at once.  It's released as soon as the
+                # iteration enters evaluation (compile+sim dispatched to
+                # workers), so new iterations can begin their LLM phase while
+                # previous iterations' long sims (~20 min) are running.  This
+                # keeps build workers continuously busy.
+                #
+                # The semaphore is threaded through _run_normal_step and
+                # _generate_child via self._iteration_sem so it can be released
+                # at the right point (after LLM gen, before eval await).
+                await sem.acquire()
+                if self.shutdown_event.is_set():
+                    sem.release()
+                    return iteration
+                self._apply_runtime_overrides()
+                if (self.database.use_paradigm_breakthrough
+                        and self.database.is_paradigm_stagnating()):
+                    await self._generate_paradigms_if_needed()
 
-                    iteration_start_time = time.time()
-                    try:
-                        result = await self._run_normal_step(iteration)
-                    except Exception as e:
-                        logger.exception(f"Iteration {iteration} failed: {e}")
-                        async with db_lock:
-                            self.database.end_iteration(iteration)
-                        return iteration
+                iteration_start_time = time.time()
+                try:
+                    result = await self._run_normal_step(iteration, release_sem=sem)
+                except Exception as e:
+                    logger.exception(f"Iteration {iteration} failed: {e}")
+                    async with db_lock:
+                        self.database.end_iteration(iteration)
+                    return iteration
 
                 iteration_time = time.time() - iteration_start_time
 
@@ -478,13 +608,23 @@ class AdaEvolveController(DiscoveryController):
         else:
             logger.warning("Failed to generate paradigms")
 
-    async def _run_normal_step(self, iteration: int) -> SerializableResult:
-        """Run a normal iteration with optional retry."""
+    async def _run_normal_step(self, iteration: int, release_sem=None) -> SerializableResult:
+        """Run a normal iteration with optional retry.
+
+        Args:
+            release_sem: If provided, an asyncio.Semaphore to release after
+                the LLM generates code and evaluation is dispatched.  This
+                lets the next iteration start its LLM phase while this one's
+                sims are still running.
+        """
         last_error = None
         attempts = 1 + (self.max_retries if self.enable_retry else 0)
 
         for attempt in range(attempts):
-            result = await self._generate_child(iteration, error_context=last_error)
+            result = await self._generate_child(
+                iteration, error_context=last_error, release_sem=release_sem,
+            )
+            release_sem = None  # only release once (first attempt)
             if not result.error:
                 return result
             last_error = result.error
@@ -573,6 +713,7 @@ class AdaEvolveController(DiscoveryController):
         iteration: int,
         error_context: Optional[str] = None,
         force_exploration: bool = False,
+        release_sem=None,
     ) -> SerializableResult:
         """Generate and evaluate a single child program."""
         try:
@@ -681,10 +822,16 @@ class AdaEvolveController(DiscoveryController):
                 context_info=context_info,
                 context_program_ids=context_program_ids,
                 other_context_programs=context_programs_dict,
+                release_sem=release_sem,
             )
 
         except Exception as e:
             logger.exception(f"Generation failed: {e}")
+            if release_sem is not None:
+                try:
+                    release_sem.release()
+                except ValueError:
+                    pass
             return SerializableResult(error=str(e), iteration=iteration)
 
     # =========================================================================
@@ -700,6 +847,7 @@ class AdaEvolveController(DiscoveryController):
         context_info: Optional[List[tuple]] = None,
         context_program_ids: Optional[List[str]] = None,
         other_context_programs: Optional[Dict] = None,
+        release_sem=None,
     ) -> SerializableResult:
         """Execute LLM generation and evaluation."""
         start_time = time.time()
@@ -759,6 +907,15 @@ class AdaEvolveController(DiscoveryController):
 
         if not child_solution:
             return SerializableResult(error="No valid solution in response", iteration=iteration)
+
+        # Release the iteration semaphore before the long eval await.
+        # LLM generation is done, code is parsed — the next iteration can now
+        # start its LLM call while this one compiles + simulates on workers.
+        if release_sem is not None:
+            try:
+                release_sem.release()
+            except ValueError:
+                pass  # already released
 
         # Evaluate
         try:
