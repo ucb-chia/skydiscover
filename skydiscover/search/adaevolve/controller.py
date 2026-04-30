@@ -374,7 +374,7 @@ class AdaEvolveController(DiscoveryController):
         self._setup_iteration_stats_logging()
 
         # Ensure all islands are seeded
-        self._ensure_all_islands_seeded()
+        await self._ensure_all_islands_seeded()
 
         if max_parallel <= 1:
             # Sequential path — original behaviour
@@ -497,7 +497,7 @@ class AdaEvolveController(DiscoveryController):
 
         return self.database.get_best_program()
 
-    def _ensure_all_islands_seeded(self) -> None:
+    async def _ensure_all_islands_seeded(self) -> None:
         """Ensure all islands have at least one program."""
         # Find a seed program
         seed_program = None
@@ -721,7 +721,7 @@ class AdaEvolveController(DiscoveryController):
                 return await self._run_from_scratch_iteration(iteration)
 
             # Ensure all islands are seeded (needed after from-scratch bootstrap)
-            self._ensure_all_islands_seeded()
+            await self._ensure_all_islands_seeded()
 
             # Sample parent and context programs (database returns standard framework dicts)
             parent_dict, context_programs_dict = self.database.sample(
