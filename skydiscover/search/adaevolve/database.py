@@ -429,7 +429,10 @@ class AdaEvolveDatabase(ProgramDatabase):
             Program ID
         """
         island_idx = target_island if target_island is not None else self.current_island
-        is_migration = target_island is not None and target_island != self.current_island
+        is_migration = (
+            (target_island is not None and target_island != self.current_island)
+            or (program.metadata or {}).get("migrated_from") is not None
+        )
 
         if island_idx < 0 or island_idx >= self.num_islands:
             raise ValueError(f"Invalid island index {island_idx}")
@@ -438,6 +441,16 @@ class AdaEvolveDatabase(ProgramDatabase):
         if iteration is not None:
             program.iteration_found = iteration
             self.last_iteration = max(self.last_iteration, iteration)
+
+        # Reject programs with code identical to an existing program on the
+        # same island.  Without this, the LLM can generate the same design
+        # repeatedly (cosmetic renames that compile to the same binary),
+        # flooding the database with duplicates and collapsing diversity.
+        if not is_migration and self._has_duplicate_solution(island_idx, program.solution):
+            logger.debug(
+                f"Rejected duplicate solution {program.id[:8]} on island {island_idx}"
+            )
+            return program.id
 
         # Add to archive or legacy list.
         # Migration copies are added to the archive/island only — NOT to the
@@ -1350,7 +1363,7 @@ class AdaEvolveDatabase(ProgramDatabase):
         # still hold them, and they're now on disk for checkpoint restore.
         self.programs = {
             pid: p for pid, p in self.programs.items()
-            if not (p.metadata or {}).get("is_migration")
+            if not ((p.metadata or {}).get("is_migration") or (p.metadata or {}).get("migrated_from") is not None)
         }
 
         # Build AdaEvolve metadata
@@ -1521,7 +1534,7 @@ class AdaEvolveDatabase(ProgramDatabase):
         # self.programs (summary, leaderboards, callbacks) shouldn't see them.
         self.programs = {
             pid: p for pid, p in self.programs.items()
-            if not (p.metadata or {}).get("is_migration")
+            if not ((p.metadata or {}).get("is_migration") or (p.metadata or {}).get("migrated_from") is not None)
         }
 
         # Restore migration event log
